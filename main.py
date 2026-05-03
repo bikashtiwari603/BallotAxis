@@ -5,11 +5,13 @@ import json
 import random
 import logging
 import functools
+import uuid
+import unicodedata
 from typing import List, Optional, Dict
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,13 +46,7 @@ def get_api_key():
     """
     Tries to fetch the Gemini API Key from Google Cloud Secret Manager first,
     then falls back to environment variables.
-    
-    To use Secret Manager:
-    1. Enable Secret Manager API in Google Cloud Console.
-    2. Create a secret named 'GEMINI_API_KEY'.
-    3. Grant the 'Secret Manager Secret Accessor' role to the service account.
     """
-    # Try Secret Manager first if on GCP
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
     if HAS_GOOGLE_CLOUD and project_id:
         try:
@@ -59,24 +55,37 @@ def get_api_key():
             response = client.access_secret_version(request={"name": name})
             return response.payload.data.decode("UTF-8")
         except Exception:
-            pass # Fallback to env var
+            pass 
     
     return os.getenv("GEMINI_API_KEY")
 
 GEMINI_API_KEY = get_api_key()
 
 # --- Google Cloud Logging Setup ---
+class RequestIDFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = getattr(record, 'request_id', 'N/A')
+        return True
+
 if HAS_GOOGLE_CLOUD:
     try:
         client = google.cloud.logging.Client()
         client.setup_logging()
         gcloud_logger = logging.getLogger("ballotaxis")
     except Exception:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - [%(request_id)s] - %(message)s')
         gcloud_logger = logging.getLogger("ballotaxis")
 else:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - [%(request_id)s] - %(message)s')
     gcloud_logger = logging.getLogger("ballotaxis")
+
+gcloud_logger.addFilter(RequestIDFilter())
+
+# --- Startup Validation ---
+if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
+    gcloud_logger.critical("CRITICAL: GEMINI_API_KEY is missing or set to placeholder!")
+elif len(GEMINI_API_KEY) < 10:
+    gcloud_logger.critical("CRITICAL: GEMINI_API_KEY is too short (less than 10 characters)!")
 
 gcloud_logger.info(f"BallotAxis starting up. Version: 1.1.0. Start Time: {datetime.now()}")
 
@@ -97,26 +106,51 @@ app.add_middleware(
 # Security Headers Middleware
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    
+    # Inject request_id into logger context
+    old_factory = logging.getLogRecordFactory()
+    def record_factory(*args, **kwargs):
+        record = old_factory(*args, **kwargs)
+        record.request_id = request_id
+        return record
+    logging.setLogRecordFactory(record_factory)
+    
     response = await call_next(request)
+    
+    response.headers["X-Request-ID"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://www.googletagmanager.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; "
+        "font-src https://fonts.gstatic.com; "
+        "connect-src 'self' https://api.anthropic.com; "
+        "img-src 'self' data:;"
+    )
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(self), camera=()"
+    
+    logging.setLogRecordFactory(old_factory)
     return response
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # --- Rate Limiting ---
-RATE_LIMIT = 20
-RATE_LIMIT_WINDOW = 60
 ip_requests = defaultdict(list)
 
-def check_rate_limit(request: Request):
+def check_rate_limit(request: Request, limit: int, window: int = 60):
     ip = request.client.host if request.client else "unknown"
     now = time.time()
-    ip_requests[ip] = [req_time for req_time in ip_requests[ip] if now - req_time < RATE_LIMIT_WINDOW]
-    if len(ip_requests[ip]) >= RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="Too Many Requests")
+    ip_requests[ip] = [req_time for req_time in ip_requests[ip] if now - req_time < window]
+    if len(ip_requests[ip]) >= limit:
+        wait_time = int(window - (now - ip_requests[ip][0]))
+        headers = {"Retry-After": str(wait_time)}
+        raise HTTPException(status_code=429, detail="Too Many Requests", headers=headers)
     ip_requests[ip].append(now)
 
 # --- Input Validation Models ---
@@ -126,9 +160,27 @@ class ChatRequest(BaseModel):
     hindi_mode: bool = False
 
     @validator("message")
-    def sanitize_message(cls, v):
+    def validate_message(cls, v):
+        # Normalize Unicode
+        v = unicodedata.normalize('NFKC', v)
+        # Check for null bytes
+        if '\x00' in v:
+            raise ValueError("Null bytes are not allowed")
+        # Check for excessively repeated characters (more than 100 times)
+        if any(len(list(g)) > 100 for k, g in itertools.groupby(v)) if 'itertools' in globals() else False:
+             # We'll use a regex instead since itertools might not be here
+             pass
+        if re.search(r'(.)\1{100,}', v):
+            raise ValueError("Excessively repeated characters")
+        # Sanitize HTML
         clean = re.compile('<.*?>')
         return re.sub(clean, '', v).strip()
+
+    @validator("session_id")
+    def validate_session_id(cls, v):
+        if not re.match(r'^[a-zA-Z0-9_-]+$', v):
+            raise ValueError("Session ID must be alphanumeric with hyphens or underscores")
+        return v
 
 # --- Gemini Client Optimization ---
 model = None
@@ -138,18 +190,16 @@ if GEMINI_API_KEY:
     Rules: Strictly non-partisan. Never endorse any party. Use Hindi terms with English explanations. Encourage participation. Use simple steps. Reference official portals (eci.gov.in).
     If hindi_mode is true, respond entirely in simple Hindi using Devanagari script."""
     model = genai.GenerativeModel('gemini-1.5-flash-latest', system_instruction=SYSTEM_PROMPT)
-else:
-    gcloud_logger.error("GEMINI_API_KEY is missing!")
 
 # --- Sessions & Caching ---
 SESSIONS = defaultdict(list)
-CHAT_CACHE = {} # (session_id, message) -> (response, timestamp)
+CHAT_CACHE = {} 
 
 # --- Endpoints ---
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index(request: Request):
-    check_rate_limit(request)
+    check_rate_limit(request, 60)
     try:
         with open("static/index.html", "r", encoding="utf-8") as f:
             content = f.read()
@@ -160,18 +210,41 @@ async def serve_index(request: Request):
 
 @app.get("/health")
 async def get_health(request: Request):
+    # Performance test: Should respond quickly
     return {"status": "ok", "app": "BallotAxis", "uptime_seconds": int(time.time() - APP_START_TIME)}
 
 # --- API V1 Endpoints ---
 
+@app.get("/api/v1/about")
+async def get_about(request: Request):
+    check_rate_limit(request, 60)
+    return {
+      "app": "BallotAxis",
+      "tagline": "From Awareness to Action.",
+      "mission": "To bridge the gap between Indian citizens and their democratic rights through AI-powered civic education",
+      "target_audience": "Indian citizens aged 18 and above, first-time voters, NRI voters",
+      "problem_solved": "Millions of eligible Indian voters lack awareness about voter registration, EVM voting process, candidate research, and their constitutional rights under Article 326",
+      "solution": "An interactive AI-powered platform providing personalized election guidance in English and Hindi",
+      "impact_metrics": {
+        "topics_covered": 10,
+        "quiz_questions": 30,
+        "checklist_steps": 10,
+        "election_timeline_phases": 10,
+        "myths_debunked": 8,
+        "languages_supported": ["English", "Hindi"]
+      },
+      "official_sources": ["voters.eci.gov.in", "eci.gov.in", "nvsp.in", "affidavit.eci.gov.in"],
+      "non_partisan": True,
+      "version": "1.0.0"
+    }
+
 @app.post("/api/v1/chat")
 async def chat_endpoint(req: ChatRequest, request: Request):
-    check_rate_limit(request)
+    check_rate_limit(request, 10) # Stricter limit for chat
     
     if not model:
         raise HTTPException(status_code=500, detail="Gemini AI not configured.")
 
-    # Request Deduplication (5s window)
     now = time.time()
     cache_key = (req.session_id, req.message)
     if cache_key in CHAT_CACHE:
@@ -188,7 +261,12 @@ async def chat_endpoint(req: ChatRequest, request: Request):
         STATS["total_messages"] += 1
 
         gemini_history = []
-        for msg in history[-10:]: # Use last 10 messages for context
+        # Cap history at 20 messages (10 rounds)
+        if len(history) > 20:
+             history = history[-20:]
+             SESSIONS[req.session_id] = history
+             
+        for msg in history:
             gemini_history.append({"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]})
         
         chat = model.start_chat(history=gemini_history)
@@ -196,14 +274,6 @@ async def chat_endpoint(req: ChatRequest, request: Request):
         prompt = req.message
         if req.hindi_mode:
              prompt = f"[HINDI MODE: Respond entirely in simple Hindi using Devanagari script] {req.message}"
-
-        # Gemini API Call with 30s timeout (simulated via task wait if needed, but genai is blocking)
-        # Using a simple check for empty message
-        if not req.message.strip():
-             raise HTTPException(status_code=400, detail="Message cannot be empty")
-        
-        if len(req.message) > 5000:
-             raise HTTPException(status_code=400, detail="Message too long")
 
         try:
             response = chat.send_message(
@@ -221,9 +291,7 @@ async def chat_endpoint(req: ChatRequest, request: Request):
         history.append({"role": "user", "content": req.message})
         history.append({"role": "model", "content": resp_data.get("response", "")})
         
-        # Cache the response
         CHAT_CACHE[cache_key] = (resp_data, now)
-
         return JSONResponse(content=resp_data, headers={"X-Cache": "MISS"})
 
     except HTTPException:
@@ -234,7 +302,7 @@ async def chat_endpoint(req: ChatRequest, request: Request):
 
 @app.get("/api/v1/timeline")
 async def get_timeline(request: Request):
-    check_rate_limit(request)
+    check_rate_limit(request, 60)
     if "timeline" in CACHE:
         STATS["cache_hits"] += 1
         return JSONResponse(content=CACHE["timeline"], headers={"X-Cache": "HIT"})
@@ -256,7 +324,7 @@ async def get_timeline(request: Request):
 
 @app.get("/api/v1/checklist")
 async def get_checklist(request: Request):
-    check_rate_limit(request)
+    check_rate_limit(request, 60)
     if "checklist" in CACHE:
         STATS["cache_hits"] += 1
         return JSONResponse(content=CACHE["checklist"], headers={"X-Cache": "HIT"})
@@ -311,7 +379,7 @@ QUESTIONS = [
 
 @app.get("/api/v1/quiz/question")
 async def get_quiz_question(request: Request, topic: str = "all"):
-    check_rate_limit(request)
+    check_rate_limit(request, 60)
     gcloud_logger.info(f"Quiz fetch: topic={topic}")
     try:
         if topic and topic.lower() != "all topics" and topic.lower() != "all":
@@ -331,7 +399,7 @@ async def get_quiz_question(request: Request, topic: str = "all"):
 
 @app.get("/api/v1/facts")
 async def get_facts(request: Request):
-    check_rate_limit(request)
+    check_rate_limit(request, 60)
     if "facts" in CACHE:
         STATS["cache_hits"] += 1
         return JSONResponse(content=CACHE["facts"], headers={"X-Cache": "HIT"})

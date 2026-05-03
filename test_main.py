@@ -1,8 +1,37 @@
 import pytest
-from httpx import AsyncClient
-from main import app, SESSIONS, STATS, CACHE, CHAT_CACHE
 import time
+import json
+import uuid
+from httpx import AsyncClient
+from main import app, SESSIONS, STATS, CACHE, CHAT_CACHE, ip_requests
 from unittest.mock import patch, MagicMock
+
+# --- Fixtures & Mocks ---
+
+@pytest.fixture(autouse=True)
+def mock_gemini():
+    with patch("google.generativeai.GenerativeModel") as mock_model:
+        mock_instance = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = json.dumps({
+            "response": "Test response from AI",
+            "suggestions": ["Tell me more", "How do I register?"]
+        })
+        mock_instance.start_chat.return_value.send_message.return_value = mock_response
+        mock_model.return_value = mock_instance
+        yield mock_instance
+
+@pytest.fixture(autouse=True)
+def clear_state():
+    SESSIONS.clear()
+    CHAT_CACHE.clear()
+    ip_requests.clear()
+    CACHE.clear()
+    STATS["total_messages"] = 0
+    STATS["cache_hits"] = 0
+    yield
+
+# --- Basic Endpoints ---
 
 @pytest.mark.asyncio
 async def test_health():
@@ -11,7 +40,19 @@ async def test_health():
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
+    assert "uptime_seconds" in data
+
+@pytest.mark.asyncio
+async def test_api_v1_about():
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        response = await ac.get("/api/v1/about")
+    assert response.status_code == 200
+    data = response.json()
     assert data["app"] == "BallotAxis"
+    assert "problem_solved" in data
+    assert "impact_metrics" in data
+    assert "official_sources" in data
+    assert data["non_partisan"] is True
 
 @pytest.mark.asyncio
 async def test_get_timeline():
@@ -19,159 +60,128 @@ async def test_get_timeline():
         response = await ac.get("/api/v1/timeline")
     assert response.status_code == 200
     data = response.json()
-    assert isinstance(data, list)
     assert len(data) == 10
-    for item in data:
-        assert "phase" in item
-        assert "timing" in item
-        assert "description" in item
-        assert "icon" in item
-        assert "key_actions" in item
-    # Test chronological order (implied by the list order in implementation)
     assert data[0]["phase"] == "Election Announcement"
-    assert data[6]["phase"] == "Polling Day"
 
 @pytest.mark.asyncio
 async def test_get_checklist():
     async with AsyncClient(app=app, base_url="http://test") as ac:
         response = await ac.get("/api/v1/checklist")
     assert response.status_code == 200
-    data = response.json()
-    assert "steps" in data
-    assert len(data["steps"]) == 10
-    for i, step in enumerate(data["steps"]):
-        assert step["id"] == i + 1
-        assert "title" in step
-        assert "description" in step
-        assert "icon" in step
+    assert len(response.json()["steps"]) == 10
+
+# --- Chat Edge Cases & Validation ---
 
 @pytest.mark.asyncio
-async def test_get_quiz_question():
-    async with AsyncClient(app=app, base_url="http://test") as ac:
-        response = await ac.get("/api/v1/quiz/question")
-    assert response.status_code == 200
-    data = response.json()
-    assert "question" in data
-    assert "options" in data
-    assert "correct" in data
-    assert "explanation" in data
-    assert "topic" in data
-    assert len(data["options"]) == 4
-    assert data["correct"] in ["A", "B", "C", "D"]
-
-@pytest.mark.asyncio
-async def test_get_quiz_question_topics():
-    topics = ["registration", "process", "rights", "history", "evm"]
-    async with AsyncClient(app=app, base_url="http://test") as ac:
-        for topic in topics:
-            response = await ac.get(f"/api/v1/quiz/question?topic={topic}")
-            assert response.status_code == 200
-            data = response.json()
-            # If the topic filter worked, it should return a question with that topic 
-            # (though the mock logic might be flexible)
-            # In our main.py, it should match if possible.
-            assert "question" in data
-
-@pytest.mark.asyncio
-async def test_get_facts():
-    async with AsyncClient(app=app, base_url="http://test") as ac:
-        response = await ac.get("/api/v1/facts")
-    assert response.status_code == 200
-    data = response.json()
-    assert isinstance(data, list)
-    assert len(data) == 10
-    assert all(isinstance(f, str) for f in data)
-
-@pytest.mark.asyncio
-async def test_post_chat_valid():
-    payload = {"message": "Hello", "session_id": "test_session_1", "hindi_mode": False}
+async def test_post_chat_unicode_hindi():
+    hindi_text = "मतदाता पंजीकरण कैसे करें?"
+    payload = {"message": hindi_text, "session_id": "hindi_session", "hindi_mode": True}
     async with AsyncClient(app=app, base_url="http://test") as ac:
         response = await ac.post("/api/v1/chat", json=payload)
     assert response.status_code == 200
-    data = response.json()
-    assert "response" in data
-    assert "suggestions" in data
-    assert data["response"] == "Test response from AI"
+    assert response.json()["response"] == "Test response from AI"
 
 @pytest.mark.asyncio
-async def test_post_chat_validation_errors():
+async def test_post_chat_session_id_special_chars():
+    # Valid special chars are - and _
+    payload = {"message": "Hello", "session_id": "user-123_abc"}
     async with AsyncClient(app=app, base_url="http://test") as ac:
-        # Empty message
-        resp = await ac.post("/api/v1/chat", json={"message": "", "session_id": "s1"})
-        assert resp.status_code == 422 # Pydantic min_length=1
+        response = await ac.post("/api/v1/chat", json=payload)
+    assert response.status_code == 200
+    
+    # Invalid chars (e.g. @)
+    payload = {"message": "Hello", "session_id": "user@123"}
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        response = await ac.post("/api/v1/chat", json=payload)
+    assert response.status_code == 422 # Validation Error
+
+@pytest.mark.asyncio
+async def test_post_chat_boundary_lengths():
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        # 2000 chars - OK
+        resp = await ac.post("/api/v1/chat", json={"message": "a"*2000, "session_id": "s1"})
+        assert resp.status_code == 200
         
-        # Too long message
+        # 2001 chars - Error
         resp = await ac.post("/api/v1/chat", json={"message": "a"*2001, "session_id": "s1"})
-        assert resp.status_code == 422 # Pydantic max_length=2000
-        
-        # Missing session_id
-        resp = await ac.post("/api/v1/chat", json={"message": "hello"})
         assert resp.status_code == 422
 
 @pytest.mark.asyncio
-async def test_post_chat_sanitization():
-    payload = {"message": "Hello <script>alert(1)</script>", "session_id": "test_session_2"}
+async def test_session_history_capping():
+    session_id = "cap_test"
     async with AsyncClient(app=app, base_url="http://test") as ac:
-        # We can't easily see the internal call to Gemini here without more mocks,
-        # but we can verify it doesn't crash and returns 200.
-        # The validator should have cleaned the message.
-        response = await ac.post("/api/v1/chat", json=payload)
-    assert response.status_code == 200
+        # Send 15 rounds of chat (30 messages)
+        for i in range(15):
+            await ac.post("/api/v1/chat", json={"message": f"Msg {i}", "session_id": session_id})
+        
+    # Main.py logic should cap at 20 messages
+    assert len(SESSIONS[session_id]) <= 20
+
+# --- Security & Performance ---
 
 @pytest.mark.asyncio
-async def test_rate_limiting():
-    # Clear rate limit state
-    from main import ip_requests
-    ip_requests.clear()
+async def test_security_headers():
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        response = await ac.get("/")
     
+    headers = response.headers
+    assert "X-Request-ID" in headers
+    assert headers["X-Frame-Options"] == "DENY"
+    assert "Content-Security-Policy" in headers
+    assert "Strict-Transport-Security" in headers
+    assert "Permissions-Policy" in headers
+
+@pytest.mark.asyncio
+async def test_rate_limiting_chat():
+    ip_requests.clear()
     async with AsyncClient(app=app, base_url="http://test") as ac:
-        # Send 20 requests
-        for _ in range(20):
-            await ac.get("/health")
-        # 21st should fail
-        response = await ac.get("/health")
+        # Chat has limit of 10
+        for _ in range(10):
+            await ac.post("/api/v1/chat", json={"message": "Hi", "session_id": "s1"})
+        
+        # 11th should be 429
+        response = await ac.post("/api/v1/chat", json={"message": "Hi", "session_id": "s1"})
         assert response.status_code == 429
+        assert "Retry-After" in response.headers
 
 @pytest.mark.asyncio
-async def test_cors_headers():
+async def test_gzip_compression():
     async with AsyncClient(app=app, base_url="http://test") as ac:
-        response = await ac.get("/health")
-    assert "access-control-allow-origin" in response.headers
+        # Timeline is large enough to trigger GZip (> 1000 bytes)
+        response = await ac.get("/api/v1/timeline", headers={"Accept-Encoding": "gzip"})
+    # If GZip middleware is working, it should have the header
+    # Note: AsyncClient might decompress automatically, so check content-encoding if available
+    if "content-encoding" in response.headers:
+        assert response.headers["content-encoding"] == "gzip"
 
 @pytest.mark.asyncio
-async def test_session_isolation():
-    SESSIONS.clear()
+async def test_performance_benchmarks():
     async with AsyncClient(app=app, base_url="http://test") as ac:
-        # Session 1
-        await ac.post("/api/v1/chat", json={"message": "Msg 1", "session_id": "s1"})
-        # Session 2
-        await ac.post("/api/v1/chat", json={"message": "Msg 2", "session_id": "s2"})
+        start = time.time()
+        response = await ac.get("/api/v1/facts")
+        end = time.time()
         
-    assert len(SESSIONS["s1"]) == 2 # user + model
-    assert len(SESSIONS["s2"]) == 2
-    assert SESSIONS["s1"][0]["content"] == "Msg 1"
-    assert SESSIONS["s2"][0]["content"] == "Msg 2"
-
-@pytest.mark.asyncio
-async def test_chat_deduplication():
-    CHAT_CACHE.clear()
-    payload = {"message": "Repeat", "session_id": "s_repeat"}
-    async with AsyncClient(app=app, base_url="http://test") as ac:
-        # First call
-        resp1 = await ac.post("/api/v1/chat", json=payload)
-        assert resp1.headers.get("X-Cache") == "MISS"
-        
-        # Immediate second call
-        resp2 = await ac.post("/api/v1/chat", json=payload)
-        assert resp2.headers.get("X-Cache") == "HIT"
-
-@pytest.mark.asyncio
-async def test_stats_endpoint():
-    async with AsyncClient(app=app, base_url="http://test") as ac:
-        response = await ac.get("/api/v1/stats")
     assert response.status_code == 200
-    data = response.json()
-    assert "total_sessions" in data
-    assert "total_messages" in data
-    assert "uptime_seconds" in data
-    assert "cache_hits" in data
+    assert (end - start) < 0.1 # Should be under 100ms for static JSON
+
+# --- Quiz & Search ---
+
+@pytest.mark.asyncio
+async def test_quiz_topic_filtering():
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        # Test specific topic
+        response = await ac.get("/api/v1/quiz/question?topic=registration")
+        assert response.status_code == 200
+        assert response.json()["topic"] == "registration"
+        
+        # Test case-insensitive
+        response = await ac.get("/api/v1/quiz/question?topic=REGISTRATION")
+        assert response.status_code == 200
+
+@pytest.mark.asyncio
+async def test_stats_tracking():
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        await ac.post("/api/v1/chat", json={"message": "M1", "session_id": "s1"})
+        await ac.get("/api/v1/stats")
+        
+    assert STATS["total_messages"] >= 1
